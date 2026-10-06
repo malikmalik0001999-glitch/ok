@@ -1,0 +1,1887 @@
+// ==UserScript==
+// @name         UST limit main Visa Post Auto-Select x25 ODD
+// @namespace    http://tampermonkey.net/
+// @version      0
+// @description  Ultra-fast visa scheduling automation with MutationObserver - Extended random slots up to 180 seconds + Preset Dropdown Toggle + Watchdog Auto-Recovery + Remote Interval Control
+// @match        https://atlasauth.b2clogin.com/*
+// @match        https://www.usvisascheduling.com/en-US/schedule/*
+// @match        https://www.usvisascheduling.com/en-US/
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @require      https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js
+// @require      https://cdn.ably.com/lib/ably.min-1.js
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+'use strict';
+
+// Default configuration
+const DEFAULT_CONFIG = {
+manualTargetPost: "ISLAMABAD",
+manualCheckInterval: 10000,
+manualCooldownDuration: 160000,
+globalCooldownOnDates: true,
+globalCooldownDuration: 160000,
+scheduledSelectionEnabled: false,   // ← DEFAULT OFF
+scheduledHours: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23],
+scheduledMinutes: ["8:0,23:0,38:0,53:0"],
+scheduledTargetPost: "ISLAMABAD",
+scheduledDuration: 65000,
+scheduledReselectInterval: 10000,
+minuteMarkSelectionEnabled: false,
+minuteMarkTimes: ["29:55", "59:54"],
+minuteMarkTargetPost: "ISLAMABAD",
+minuteMarkDuration: 30000,
+minuteMarkReselectInterval: 1000,
+randomSlotSelectionEnabled: true,
+randomSlot: "manual",
+randomTargetPost: "ISLAMABAD",
+manualRandomSlot: "138-140",
+// New Day/Night mode settings
+dayNightMode: "day", // "day" or "night"
+storedDaySettings: {
+minuteMarkTimes: ["29:55", "59:54"],
+minuteMarkDuration: 14000
+},
+// === CUSTOM WINDOW (28/29 min burst) ===
+customWindowEnabled: true,
+customWindowMinutes: "28, 29",
+customWindowW1Start: 0,
+customWindowW1End: 20,
+customWindowW1Interval: 4,
+customWindowW2Start: 30,
+customWindowW2End: 40,
+customWindowW2Interval: 3
+};
+
+let CONFIG = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+const savedConfig = GM_getValue('usvisaEnhancedConfig');
+if (savedConfig) {
+CONFIG = {...DEFAULT_CONFIG, ...JSON.parse(savedConfig)};
+}
+
+const POSTS = {
+ISLAMABAD: {
+value: 'b06af614-b0db-ec11-a7b4-001dd80234f6',
+display: 'ISB',
+keywords: ['islamabad', 'isb']
+},
+KARACHI: {
+value: 'be6af614-b0db-ec11-a7b4-001dd80234f6',
+display: 'KHI',
+keywords: ['karachi', 'khi']
+}
+};
+
+// ← CHANGED: only skip minute 0, 29, 30 — all others now active for random slot
+const SKIPPED_MINUTES = [0, 29, 30];
+
+// Night mode time patterns
+const NIGHT_MODE_PATTERNS = [
+["29:55", "59:55"],
+["29:56", "59:56"],
+["29:57", "59:57"],
+["29:58", "59:58"]
+];
+
+// =============================================
+// PRESET DEFINITIONS
+// =============================================
+
+// Scheduled Selection presets
+const SCHEDULED_PRESETS = [
+{ label: "— Select —", value: "" },
+{ label: "7:58, 22:58, 37:58, 52:58", value: "7:58,22:58,37:58,52:58" },
+{ label: "7:59, 22:59, 37:59, 52:59", value: "7:59,22:59,37:59,52:59" },
+{ label: "8:00, 23:00, 38:00, 53:00", value: "8:00,23:00,38:00,53:00" },
+{ label: "8:01, 23:01, 38:01, 53:01", value: "8:01,23:01,38:01,53:01" },
+{ label: "8:02, 23:02, 38:02, 53:02", value: "8:02,23:02,38:02,53:02" },
+{ label: "8:03, 23:03, 38:03, 53:03", value: "8:03,23:03,38:03,53:03" },
+{ label: "8:04, 23:04, 34:04, 53:04", value: "8:04,23:04,34:04,53:04" },
+];
+
+// Minute Mark presets
+const MINUTE_MARK_PRESETS = (() => {
+const presets = [{ label: "— Select —", value: "" }];
+for (let sec = 42; sec <= 58; sec++) {
+presets.push({
+label: `29:${sec}, 59:${sec}`,
+value: `29:${sec},59:${sec}`
+});
+}
+return presets;
+})();
+
+let state = {
+manualIsRunning: false,
+manualIsCooldown: false,
+manualCooldownEnd: 0,
+globalCooldownActive: false,
+globalCooldownEnd: 0,
+scheduledIsActive: false,
+scheduledEndTime: 0,
+scheduledIntervalId: null,
+nextScheduledRun: 0,
+minuteMarkLastRun: 0,
+minuteMarkActive: false,
+minuteMarkEndTime: 0,
+minuteMarkIntervalId: null,
+lastRandomIntervalKey: 0,
+randomSecond: 0,
+randomTriggered: false,
+showSettings: false,
+isCurrentlySelecting: false,
+lastSelectionAttempt: 0,
+lastScheduledSelection: 0,
+lastMinuteMarkSelection: 0,
+lastCustomWindowFiredSecond: -1,
+// === WATCHDOG STATE ===
+watchdogLastFired: 0,
+isCurrentlySelectingSetAt: 0
+};
+
+let manualIntervalId;
+let timeCheckIntervalId;
+let minuteMarkCheckIntervalId;
+let randomCheckIntervalId;
+let loadingCheckIntervalId;
+let watchdogIntervalId;
+let dateObserver = null;
+
+// === SCREEN FLASH FUNCTION ===
+const flashScreen = (color, duration = 1000) => {
+const flash = document.createElement('div');
+flash.style.position = 'fixed';
+flash.style.top = '0';
+flash.style.left = '0';
+flash.style.width = '100vw';
+flash.style.height = '100vh';
+flash.style.backgroundColor = color;
+flash.style.opacity = '0.3';
+flash.style.zIndex = '1000000';
+flash.style.pointerEvents = 'none';
+flash.style.transition = 'opacity 0.3s ease';
+document.body.appendChild(flash);
+setTimeout(() => { flash.style.opacity = '0.3'; }, 10);
+setTimeout(() => {
+flash.style.opacity = '0';
+setTimeout(() => { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 300);
+}, duration);
+};
+
+// === MUTATION OBSERVER FOR DATE DETECTION ===
+const setupDateObserver = () => {
+const targetNode = document.querySelector('.ui-datepicker-calendar') || document.body;
+dateObserver = new MutationObserver((mutations) => {
+if (!CONFIG.globalCooldownOnDates || state.globalCooldownActive) return;
+for (const mutation of mutations) {
+if (document.querySelector('a.ui-state-default:not(.ui-state-disabled)')) {
+startGlobalCooldown();
+break;
+}
+}
+});
+dateObserver.observe(targetNode, { childList: true, subtree: true, attributes: false });
+};
+
+// === RESTART FUNCTION ===
+const restartScript = () => {
+stopCustomWindowLoop();
+if (manualIntervalId) clearInterval(manualIntervalId);
+if (timeCheckIntervalId) clearInterval(timeCheckIntervalId);
+if (minuteMarkCheckIntervalId) clearInterval(minuteMarkCheckIntervalId);
+if (randomCheckIntervalId) clearInterval(randomCheckIntervalId);
+if (loadingCheckIntervalId) clearInterval(loadingCheckIntervalId);
+if (watchdogIntervalId) clearInterval(watchdogIntervalId);
+if (state.scheduledIntervalId) clearInterval(state.scheduledIntervalId);
+if (state.minuteMarkIntervalId) clearInterval(state.minuteMarkIntervalId);
+if (dateObserver) dateObserver.disconnect();
+
+const currentConfig = {...CONFIG};
+Object.assign(state, {
+manualIsRunning: false,
+manualIsCooldown: false,
+manualCooldownEnd: 0,
+globalCooldownActive: false,
+globalCooldownEnd: 0,
+scheduledIsActive: false,
+scheduledEndTime: 0,
+scheduledIntervalId: null,
+nextScheduledRun: 0,
+minuteMarkLastRun: 0,
+minuteMarkActive: false,
+minuteMarkEndTime: 0,
+minuteMarkIntervalId: null,
+lastRandomIntervalKey: 0,
+randomSecond: 0,
+randomTriggered: false,
+showSettings: false,
+isCurrentlySelecting: false,
+lastSelectionAttempt: 0,
+lastScheduledSelection: 0,
+lastMinuteMarkSelection: 0,
+lastCustomWindowFiredSecond: -1,
+watchdogLastFired: 0,
+isCurrentlySelectingSetAt: 0
+});
+
+manualIntervalId = null;
+timeCheckIntervalId = null;
+minuteMarkCheckIntervalId = null;
+randomCheckIntervalId = null;
+loadingCheckIntervalId = null;
+watchdogIntervalId = null;
+dateObserver = null;
+
+CONFIG = {...currentConfig};
+saveState();
+
+setTimeout(() => {
+setupDateObserver();
+if (state.manualIsRunning) {
+manualIntervalId = setInterval(manualRunCheck, CONFIG.manualCheckInterval);
+}
+timeCheckIntervalId = setInterval(checkScheduledTimes, 1000);
+minuteMarkCheckIntervalId = setInterval(checkMinuteMarks, 1000);
+randomCheckIntervalId = setInterval(checkRandomSlots, 200);
+loadingCheckIntervalId = setInterval(() => {
+if (state.isCurrentlySelecting && !isLoadingVisible()) {
+state.isCurrentlySelecting = false;
+}
+}, 500);
+watchdogIntervalId = setInterval(runWatchdog, 5000);
+startCustomWindowLoop();
+calculateNextScheduledRun();
+showFeedback('Script restarted successfully!');
+updateUI();
+}, 100);
+};
+
+// === STATE MANAGEMENT ===
+const saveState = () => {
+GM_setValue('usvisaEnhancedState', JSON.stringify(state));
+};
+
+const loadState = () => {
+const saved = GM_getValue('usvisaEnhancedState');
+if (saved) {
+try {
+const parsed = JSON.parse(saved);
+Object.assign(state, parsed);
+} catch (e) {
+console.error('Error loading state:', e);
+}
+}
+};
+
+const saveConfig = () => {
+GM_setValue('usvisaEnhancedConfig', JSON.stringify(CONFIG));
+};
+
+// === LOADING DETECTION ===
+const isLoadingVisible = () => {
+const loadingElement = document.querySelector('p#datepicker-message.text-center');
+return loadingElement?.textContent.includes('Loading') && loadingElement.offsetParent !== null;
+};
+
+const canReselect = () => {
+return !isLoadingVisible() && (Date.now() - state.lastSelectionAttempt) >= 100;
+};
+
+// === CORE FUNCTIONS ===
+const isInCooldown = () => {
+return state.manualIsCooldown || state.globalCooldownActive;
+};
+
+const resetAllCooldowns = () => {
+state.manualIsCooldown = false;
+state.manualCooldownEnd = 0;
+state.globalCooldownActive = false;
+state.globalCooldownEnd = 0;
+resetPostSelection();
+saveState();
+updateUI();
+showFeedback('All cooldowns reset!');
+};
+
+// =============================================
+// COOLDOWN: PAUSE EVERYTHING, RESUME AFTER
+// =============================================
+const startGlobalCooldown = () => {
+if (!CONFIG.globalCooldownOnDates) return;
+
+if (state.manualIsRunning) {
+state.manualIsRunning = false;
+clearInterval(manualIntervalId);
+}
+if (state.scheduledIsActive) stopScheduledSelection();
+if (state.minuteMarkActive) stopMinuteMarkSelection();
+
+state.globalCooldownActive = true;
+state.globalCooldownEnd = Date.now() + CONFIG.globalCooldownDuration;
+saveState();
+flashScreen('#FF0000', 2000);
+showFeedback('🔴 Dates found — ALL selections PAUSED for cooldown');
+updateUI();
+
+setTimeout(() => {
+state.globalCooldownActive = false;
+state.globalCooldownEnd = 0;
+saveState();
+showFeedback('✅ Global cooldown finished — selections can resume');
+updateUI();
+if (!isInCooldown()) resetPostSelection();
+}, CONFIG.globalCooldownDuration);
+};
+
+const resetPostSelection = () => {
+const dropdown = document.getElementById('post_select');
+if (dropdown) {
+dropdown.value = '';
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+showFeedback('Post selection reset');
+}
+};
+
+// === DATE CHECKING ===
+const checkForAvailableDates = () => {
+if (!CONFIG.globalCooldownOnDates || state.globalCooldownActive) return false;
+if (document.querySelector('a.ui-state-default:not(.ui-state-disabled)')) {
+startGlobalCooldown();
+return true;
+}
+return false;
+};
+
+// =============================================
+// WATCHDOG AUTO-RECOVERY
+// =============================================
+const runWatchdog = () => {
+const now = Date.now();
+let recovered = false;
+
+if (state.manualIsCooldown && state.manualCooldownEnd > 0 && now > state.manualCooldownEnd) {
+state.manualIsCooldown = false;
+state.manualCooldownEnd = 0;
+showFeedback('🐕 Watchdog: stale manual cooldown cleared');
+recovered = true;
+}
+
+if (state.globalCooldownActive && state.globalCooldownEnd > 0 && now > state.globalCooldownEnd) {
+state.globalCooldownActive = false;
+state.globalCooldownEnd = 0;
+showFeedback('🐕 Watchdog: stale global cooldown cleared');
+recovered = true;
+}
+
+if (state.isCurrentlySelecting) {
+const stuckFor = state.isCurrentlySelectingSetAt > 0 ? (now - state.isCurrentlySelectingSetAt) : 0;
+if (stuckFor > 30000) {
+state.isCurrentlySelecting = false;
+state.isCurrentlySelectingSetAt = 0;
+showFeedback('🐕 Watchdog: unstuck isCurrentlySelecting');
+recovered = true;
+}
+}
+
+if (!isInCooldown()) {
+const FREEZE_THRESHOLD = 30000;
+
+if (state.minuteMarkActive && state.minuteMarkEndTime > now) {
+const timeSinceFire = now - state.lastMinuteMarkSelection;
+if (timeSinceFire > FREEZE_THRESHOLD) {
+console.warn('[Watchdog] MinuteMark window active but no fire in 30s — recovering');
+softRecoverSelection('minuteMark');
+recovered = true;
+}
+}
+
+if (state.scheduledIsActive && state.scheduledEndTime > now) {
+const timeSinceFire = now - state.lastScheduledSelection;
+if (timeSinceFire > FREEZE_THRESHOLD) {
+console.warn('[Watchdog] Scheduled window active but no fire in 30s — recovering');
+softRecoverSelection('scheduled');
+recovered = true;
+}
+}
+}
+
+if (recovered) {
+state.watchdogLastFired = now;
+saveState();
+updateUI();
+}
+};
+
+const softRecoverSelection = (mode) => {
+if (isInCooldown()) return;
+
+flashScreen('#FF6600', 600);
+const dropdown = document.getElementById('post_select');
+if (!dropdown) {
+showFeedback('🐕 Watchdog: no dropdown found, skip recovery');
+return;
+}
+
+dropdown.value = '';
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+
+setTimeout(() => {
+if (isInCooldown()) return;
+const dropdown2 = document.getElementById('post_select');
+if (!dropdown2) return;
+
+const targetKey = mode === 'minuteMark' ? CONFIG.minuteMarkTargetPost : CONFIG.scheduledTargetPost;
+const target = POSTS[targetKey];
+if (!target) return;
+
+dropdown2.value = target.value;
+dropdown2.dispatchEvent(new Event('change', { bubbles: true }));
+
+state.lastSelectionAttempt = Date.now();
+state.isCurrentlySelecting = true;
+state.isCurrentlySelectingSetAt = Date.now();
+
+if (mode === 'minuteMark') {
+state.lastMinuteMarkSelection = Date.now();
+} else {
+state.lastScheduledSelection = Date.now();
+}
+
+showFeedback(`🐕 Watchdog recovered ${mode} — re-selected ${targetKey}`);
+saveState();
+}, 200);
+};
+
+// === MANUAL SELECTION ===
+const manualSelectPost = () => {
+if (isInCooldown() || !canReselect()) return false;
+const dropdown = document.getElementById('post_select');
+if (!dropdown) return false;
+const target = POSTS[CONFIG.manualTargetPost];
+dropdown.value = target.value;
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+state.lastSelectionAttempt = Date.now();
+state.isCurrentlySelecting = true;
+state.isCurrentlySelectingSetAt = Date.now();
+return true;
+};
+
+const manualCheckForDates = () => {
+if (checkForAvailableDates()) {
+state.manualIsCooldown = true;
+state.manualCooldownEnd = Date.now() + CONFIG.manualCooldownDuration;
+saveState();
+setTimeout(() => {
+state.manualIsCooldown = false;
+state.manualCooldownEnd = 0;
+saveState();
+showFeedback('Manual cooldown finished');
+updateUI();
+if (!isInCooldown()) resetPostSelection();
+}, CONFIG.manualCooldownDuration);
+return true;
+}
+return false;
+};
+
+const manualRunCheck = () => {
+if (!state.manualIsRunning || isInCooldown()) return;
+manualSelectPost();
+manualCheckForDates();
+};
+
+// === DAY/NIGHT MODE FUNCTIONS ===
+const enableNightMode = () => {
+if (CONFIG.dayNightMode === "night") return;
+CONFIG.storedDaySettings = {
+minuteMarkTimes: [...CONFIG.minuteMarkTimes],
+minuteMarkDuration: CONFIG.minuteMarkDuration,
+minuteMarkReselectInterval: CONFIG.minuteMarkReselectInterval
+};
+const randomPattern = NIGHT_MODE_PATTERNS[Math.floor(Math.random() * NIGHT_MODE_PATTERNS.length)];
+CONFIG.minuteMarkTimes = [...randomPattern];
+CONFIG.minuteMarkDuration = 14000;
+CONFIG.minuteMarkReselectInterval = 500;
+CONFIG.dayNightMode = "night";
+saveConfig();
+showFeedback('Night Mode enabled - Random 55-58 second patterns');
+flashScreen('#4B0082');
+updateUI();
+};
+
+const enableDayMode = () => {
+if (CONFIG.dayNightMode === "day") return;
+CONFIG.minuteMarkTimes = [...CONFIG.storedDaySettings.minuteMarkTimes];
+CONFIG.minuteMarkDuration = CONFIG.storedDaySettings.minuteMarkDuration;
+CONFIG.minuteMarkReselectInterval = 1000;
+CONFIG.dayNightMode = "day";
+saveConfig();
+showFeedback('Day Mode enabled - Original times restored');
+flashScreen('#FFD700');
+updateUI();
+};
+
+// === SCHEDULED SELECTION ===
+const scheduledSelectPost = () => {
+if (isInCooldown() || !canReselect()) return false;
+const dropdown = document.getElementById('post_select');
+if (!dropdown) return false;
+const target = POSTS[CONFIG.scheduledTargetPost];
+dropdown.value = target.value;
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+state.lastSelectionAttempt = Date.now();
+state.lastScheduledSelection = Date.now();
+state.isCurrentlySelecting = true;
+state.isCurrentlySelectingSetAt = Date.now();
+showFeedback(`Scheduled: Selected ${CONFIG.scheduledTargetPost}`);
+return true;
+};
+
+const startScheduledSelection = () => {
+if (state.scheduledIsActive || isInCooldown()) return;
+state.scheduledIsActive = true;
+state.scheduledEndTime = Date.now() + CONFIG.scheduledDuration;
+saveState();
+showFeedback(`Scheduled selection started for ${CONFIG.scheduledTargetPost}`);
+updateUI();
+scheduledSelectPost();
+state.scheduledIntervalId = setInterval(() => {
+if (!state.scheduledIsActive) return;
+if (isInCooldown()) { stopScheduledSelection(); return; }
+if (Date.now() - state.lastScheduledSelection >= CONFIG.scheduledReselectInterval) {
+if (checkForAvailableDates()) {
+stopScheduledSelection();
+return;
+}
+scheduledSelectPost();
+}
+}, 1000);
+setTimeout(() => {
+stopScheduledSelection();
+showFeedback('Scheduled selection period ended');
+}, CONFIG.scheduledDuration);
+};
+
+const stopScheduledSelection = () => {
+if (!state.scheduledIsActive) return;
+clearInterval(state.scheduledIntervalId);
+state.scheduledIsActive = false;
+state.scheduledEndTime = 0;
+state.scheduledIntervalId = null;
+saveState();
+updateUI();
+};
+
+const calculateNextScheduledRun = () => {
+if (!CONFIG.scheduledSelectionEnabled) return;
+const now = new Date();
+let nextRun = null;
+for (const hour of CONFIG.scheduledHours) {
+for (const timeStr of CONFIG.scheduledMinutes) {
+const [minutesStr, secondsStr = "0"] = timeStr.split(':');
+const scheduledMinute = parseInt(minutesStr);
+const scheduledSecond = parseInt(secondsStr);
+const scheduledTime = new Date();
+scheduledTime.setHours(hour, scheduledMinute, scheduledSecond, 0);
+if (scheduledTime <= now) scheduledTime.setDate(scheduledTime.getDate() + 1);
+if (!nextRun || scheduledTime < nextRun) nextRun = scheduledTime;
+}
+}
+state.nextScheduledRun = nextRun ? nextRun.getTime() : 0;
+saveState();
+};
+
+const checkScheduledTimes = () => {
+if (!CONFIG.scheduledSelectionEnabled) return;
+if (isInCooldown()) return;
+const now = new Date();
+const currentHour = now.getHours();
+const currentMinute = now.getMinutes();
+const currentSecond = now.getSeconds();
+if (!state.nextScheduledRun || state.nextScheduledRun < Date.now()) {
+calculateNextScheduledRun();
+}
+if (CONFIG.scheduledHours.includes(currentHour)) {
+CONFIG.scheduledMinutes.forEach(scheduledTime => {
+const [minutesStr, secondsStr = "0"] = scheduledTime.split(':');
+const scheduledMinute = parseInt(minutesStr);
+const scheduledSecond = parseInt(secondsStr);
+if (currentMinute === scheduledMinute && currentSecond === scheduledSecond) {
+if (!state.scheduledIsActive && !isInCooldown()) {
+startScheduledSelection();
+}
+}
+});
+}
+};
+
+// === MINUTE MARK SELECTION ===
+const minuteMarkSelectPost = () => {
+if (isInCooldown() || !canReselect()) return false;
+const dropdown = document.getElementById('post_select');
+if (!dropdown) return false;
+const target = POSTS[CONFIG.minuteMarkTargetPost];
+dropdown.value = target.value;
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+state.lastSelectionAttempt = Date.now();
+state.lastMinuteMarkSelection = Date.now();
+state.isCurrentlySelecting = true;
+state.isCurrentlySelectingSetAt = Date.now();
+showFeedback(`Minute mark: Selected ${CONFIG.minuteMarkTargetPost}`);
+return true;
+};
+
+const startMinuteMarkSelection = () => {
+if (state.minuteMarkActive || isInCooldown()) return;
+state.minuteMarkActive = true;
+state.minuteMarkEndTime = Date.now() + CONFIG.minuteMarkDuration;
+saveState();
+showFeedback(`Minute mark selection started for ${CONFIG.minuteMarkTargetPost}`);
+updateUI();
+minuteMarkSelectPost();
+state.minuteMarkIntervalId = setInterval(() => {
+if (!state.minuteMarkActive) return;
+if (isInCooldown()) { stopMinuteMarkSelection(); return; }
+if (Date.now() - state.lastMinuteMarkSelection >= CONFIG.minuteMarkReselectInterval) {
+if (checkForAvailableDates()) {
+stopMinuteMarkSelection();
+return;
+}
+minuteMarkSelectPost();
+}
+}, 1000);
+setTimeout(() => {
+stopMinuteMarkSelection();
+showFeedback('Minute mark selection period ended');
+}, CONFIG.minuteMarkDuration);
+};
+
+const stopMinuteMarkSelection = () => {
+if (!state.minuteMarkActive) return;
+clearInterval(state.minuteMarkIntervalId);
+state.minuteMarkActive = false;
+state.minuteMarkEndTime = 0;
+state.minuteMarkIntervalId = null;
+saveState();
+updateUI();
+};
+
+const checkMinuteMarks = () => {
+if (!CONFIG.minuteMarkSelectionEnabled) return;
+if (isInCooldown()) return;
+const now = new Date();
+const currentMinute = now.getMinutes();
+const currentSecond = now.getSeconds();
+CONFIG.minuteMarkTimes.forEach(timeStr => {
+const [minutesStr, secondsStr = "0"] = timeStr.split(':');
+const targetMinute = parseInt(minutesStr);
+const targetSecond = parseInt(secondsStr);
+if (currentMinute === targetMinute && currentSecond === targetSecond) {
+if (state.minuteMarkLastRun < now.setSeconds(targetSecond, 0)) {
+if (!state.minuteMarkActive && !isInCooldown()) {
+startMinuteMarkSelection();
+state.minuteMarkLastRun = Date.now();
+saveState();
+}
+}
+}
+});
+};
+
+// === CUSTOM WINDOW RELOAD — high-precision rAF loop ===
+let _cwRafId = null;
+const _cwFired = new Set();
+
+const _customWindowTick = () => {
+if (!CONFIG.customWindowEnabled) {
+_cwRafId = requestAnimationFrame(_customWindowTick);
+return;
+}
+
+const now = new Date();
+const currentMinute = now.getMinutes();
+const currentSecond = now.getSeconds();
+
+const targetMinutes = String(CONFIG.customWindowMinutes)
+.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+
+if (!targetMinutes.includes(currentMinute)) {
+_cwFired.clear();
+_cwRafId = requestAnimationFrame(_customWindowTick);
+return;
+}
+
+if (!isInCooldown()) {
+const w1s  = CONFIG.customWindowW1Start;
+const w1e  = CONFIG.customWindowW1End;
+const iv1  = CONFIG.customWindowW1Interval || 4;
+const w2s  = CONFIG.customWindowW2Start;
+const w2e  = CONFIG.customWindowW2End;
+const iv2  = CONFIG.customWindowW2Interval || 3;
+
+const inW1 = currentSecond >= w1s && currentSecond <= w1e && (currentSecond - w1s) % iv1 === 0;
+const inW2 = currentSecond >= w2s && currentSecond <= w2e && (currentSecond - w2s) % iv2 === 0;
+
+if (inW1 || inW2) {
+const fireKey = currentMinute * 100 + currentSecond;
+if (!_cwFired.has(fireKey)) {
+_cwFired.add(fireKey);
+minuteMarkSelectPost();
+showFeedback(`⚡ W${inW1 ? 1 : 2} M${currentMinute}:${String(currentSecond).padStart(2,'0')} → reload`);
+}
+}
+}
+
+_cwRafId = requestAnimationFrame(_customWindowTick);
+};
+
+const startCustomWindowLoop = () => {
+if (_cwRafId) cancelAnimationFrame(_cwRafId);
+_cwFired.clear();
+_cwRafId = requestAnimationFrame(_customWindowTick);
+};
+const stopCustomWindowLoop = () => {
+if (_cwRafId) { cancelAnimationFrame(_cwRafId); _cwRafId = null; }
+_cwFired.clear();
+};
+
+const checkCustomWindows = () => {};
+
+// === RANDOM SLOT SELECTION ===
+const RANDOM_INTERVAL = 140;
+
+const randomSelectPost = () => {
+if (isInCooldown() || !canReselect()) return false;
+const dropdown = document.getElementById('post_select');
+if (!dropdown) return false;
+const target = POSTS[CONFIG.randomTargetPost];
+dropdown.value = target.value;
+dropdown.dispatchEvent(new Event('change', { bubbles: true }));
+state.lastSelectionAttempt = Date.now();
+state.isCurrentlySelecting = true;
+state.isCurrentlySelectingSetAt = Date.now();
+flashScreen('#00FF00');
+showFeedback(`Random: Selected ${CONFIG.randomTargetPost}`);
+return true;
+};
+
+const checkRandomSlots = () => {
+if (!CONFIG.randomSlotSelectionEnabled || state.manualIsRunning) return;
+if (isInCooldown()) return;
+
+const now = new Date();
+const currentMinute = now.getMinutes();
+const currentSecond = now.getSeconds();
+const totalSeconds = (currentMinute * 60) + currentSecond;
+
+const intervalKey = Math.floor(totalSeconds / RANDOM_INTERVAL);
+
+if (SKIPPED_MINUTES.includes(currentMinute)) {
+if (intervalKey !== state.lastRandomIntervalKey) {
+state.lastRandomIntervalKey = intervalKey;
+state.randomTriggered = false;
+saveState();
+}
+return;
+}
+
+if (intervalKey !== state.lastRandomIntervalKey) {
+if (CONFIG.randomSlot === "manual") {
+const [startStr, endStr] = CONFIG.manualRandomSlot.split('-');
+const start = parseInt(startStr);
+const end = parseInt(endStr);
+if (!isNaN(start) && !isNaN(end) && start >= 0 && end <= RANDOM_INTERVAL && start < end) {
+state.randomSecond = Math.floor(Math.random() * (end - start + 1)) + start;
+} else {
+state.randomSecond = 135 + Math.floor(Math.random() * 6);
+}
+} else {
+const [startStr, endStr] = CONFIG.randomSlot.split('-');
+const start = parseInt(startStr);
+const end = parseInt(endStr);
+state.randomSecond = Math.floor(Math.random() * (end - start + 1)) + start;
+}
+state.lastRandomIntervalKey = intervalKey;
+state.randomTriggered = false;
+saveState();
+}
+
+if (!state.randomTriggered) {
+const positionInBlock = totalSeconds % RANDOM_INTERVAL;
+if (positionInBlock >= state.randomSecond) {
+if (!isInCooldown()) {
+randomSelectPost();
+state.randomTriggered = true;
+saveState();
+}
+}
+}
+};
+
+// === POST SWITCHING FUNCTIONS ===
+const switchToIslamabad = () => {
+CONFIG.manualTargetPost = "ISLAMABAD";
+CONFIG.scheduledTargetPost = "ISLAMABAD";
+CONFIG.minuteMarkTargetPost = "ISLAMABAD";
+CONFIG.randomTargetPost = "ISLAMABAD";
+saveConfig();
+flashScreen('#00FF00');
+showFeedback('Switched all target posts to Islamabad');
+updateUI();
+};
+
+const switchToKarachi = () => {
+CONFIG.manualTargetPost = "KARACHI";
+CONFIG.scheduledTargetPost = "KARACHI";
+CONFIG.minuteMarkTargetPost = "KARACHI";
+CONFIG.randomTargetPost = "KARACHI";
+saveConfig();
+flashScreen('#00FF00');
+showFeedback('Switched all target posts to Karachi');
+updateUI();
+};
+
+// === UI FUNCTIONS ===
+const showFeedback = (msg) => {
+const el = document.getElementById('feedback-message');
+if (el) {
+el.textContent = msg;
+el.style.opacity = 1;
+setTimeout(() => el.style.opacity = 0, 2000);
+}
+};
+
+const getRemainingCooldown = (endTime) => {
+return Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+};
+
+const getStatusText = () => {
+let status = [];
+if (state.manualIsCooldown) {
+status.push(`Manual: Cooldown ${getRemainingCooldown(state.manualCooldownEnd)}s`);
+} else if (state.manualIsRunning) {
+status.push(`Manual: Active (${CONFIG.manualCheckInterval/1000}s)`);
+} else {
+status.push("Manual: Stopped");
+}
+if (state.globalCooldownActive) {
+status.push(`🔴 Global Cooldown ${getRemainingCooldown(state.globalCooldownEnd)}s — ALL PAUSED`);
+}
+status.push(`Mode: ${CONFIG.dayNightMode === 'night' ? '🌙 Night' : '☀️ Day'}`);
+status.push(`⏱ Reselect: ${CONFIG.minuteMarkReselectInterval}ms`);
+if (state.watchdogLastFired > 0) {
+const secAgo = Math.floor((Date.now() - state.watchdogLastFired) / 1000);
+if (secAgo < 60) status.push(`🐕 ${secAgo}s ago`);
+}
+return status.join(" | ");
+};
+
+const updateIntervals = () => {
+if (state.manualIsRunning) {
+clearInterval(manualIntervalId);
+manualIntervalId = setInterval(manualRunCheck, CONFIG.manualCheckInterval);
+}
+clearInterval(timeCheckIntervalId);
+timeCheckIntervalId = setInterval(checkScheduledTimes, 1000);
+clearInterval(minuteMarkCheckIntervalId);
+minuteMarkCheckIntervalId = setInterval(checkMinuteMarks, 1000);
+clearInterval(randomCheckIntervalId);
+randomCheckIntervalId = setInterval(checkRandomSlots, 200);
+clearInterval(loadingCheckIntervalId);
+loadingCheckIntervalId = setInterval(() => {
+if (state.isCurrentlySelecting && !isLoadingVisible()) {
+state.isCurrentlySelecting = false;
+}
+}, 500);
+};
+
+// =============================================
+// SETTINGS FORM
+// =============================================
+const createSettingsForm = () => {
+const twoSecondOptions = [];
+for (let i = 0; i < RANDOM_INTERVAL; i += 2) {
+const start = i;
+const end = i + 2;
+if (end <= RANDOM_INTERVAL) {
+twoSecondOptions.push(`<option value="${start}-${end}"${CONFIG.randomSlot === `${start}-${end}` ? ' selected' : ''}>${start}-${end} seconds</option>`);
+}
+}
+const oddTwoSecondOptions = [];
+for (let i = 1; i < RANDOM_INTERVAL - 1; i += 2) {
+const start = i;
+const end = i + 2;
+if (end <= RANDOM_INTERVAL) {
+oddTwoSecondOptions.push(`<option value="${start}-${end}"${CONFIG.randomSlot === `${start}-${end}` ? ' selected' : ''}>${start}-${end} seconds</option>`);
+}
+}
+
+const form = document.createElement('div');
+form.id = 'settings-form';
+form.innerHTML = `
+<div class="settings-section">
+<h3>Manual Selection Settings</h3>
+<div class="setting-row">
+<label>Target Post:</label>
+<select id="manual-target-post">
+<option value="ISLAMABAD"${CONFIG.manualTargetPost === 'ISLAMABAD' ? ' selected' : ''}>Islamabad</option>
+<option value="KARACHI"${CONFIG.manualTargetPost === 'KARACHI' ? ' selected' : ''}>Karachi</option>
+</select>
+</div>
+<div class="setting-row">
+<label>Check Interval (ms):</label>
+<input type="number" id="manual-interval" value="${CONFIG.manualCheckInterval}" min="1000" step="1000">
+</div>
+<div class="setting-row">
+<label>Cooldown (ms):</label>
+<input type="number" id="manual-cooldown" value="${CONFIG.manualCooldownDuration}" min="1000" step="1000">
+</div>
+</div>
+<div class="settings-section">
+<h3>Global Settings</h3>
+<div class="setting-row">
+<label>Enable Global Cooldown:</label>
+<input type="checkbox" id="global-cooldown-toggle"${CONFIG.globalCooldownOnDates ? ' checked' : ''}>
+</div>
+<div class="setting-row">
+<label>Global Cooldown (ms):</label>
+<input type="number" id="global-cooldown-duration" value="${CONFIG.globalCooldownDuration}" min="1000" step="1000">
+</div>
+</div>
+<div class="settings-section">
+<h3>Scheduled Selection Settings</h3>
+<div class="setting-row">
+<label>Enable Scheduled Selection:</label>
+<input type="checkbox" id="scheduled-enabled"${CONFIG.scheduledSelectionEnabled ? ' checked' : ''}>
+</div>
+<div class="setting-row">
+<label>Target Post:</label>
+<select id="scheduled-target-post">
+<option value="ISLAMABAD"${CONFIG.scheduledTargetPost === 'ISLAMABAD' ? ' selected' : ''}>Islamabad</option>
+<option value="KARACHI"${CONFIG.scheduledTargetPost === 'KARACHI' ? ' selected' : ''}>Karachi</option>
+</select>
+</div>
+<div class="setting-row">
+<label>Trigger Hours (0-23, comma separated):</label>
+<input type="text" id="scheduled-hours" value="${CONFIG.scheduledHours.join(', ')}" placeholder="3, 4, 5">
+</div>
+<div class="setting-row">
+<label>Trigger Times (mm:ss, comma separated):</label>
+<input type="text" id="scheduled-minutes" value="${CONFIG.scheduledMinutes.map(m => m.includes(':') ? m : `${m}:0`).join(', ')}" placeholder="55:0, 30:15">
+</div>
+<div class="setting-row">
+<label>⚡ Quick Preset:</label>
+<select id="sched-single-preset" class="preset-inline-select">
+${SCHEDULED_PRESETS.map(p => `<option value="${p.value}">${p.label}</option>`).join('')}
+</select>
+</div>
+<div class="setting-row">
+<label>Duration (ms):</label>
+<input type="number" id="scheduled-duration" value="${CONFIG.scheduledDuration}" min="1000" step="1000">
+</div>
+<div class="setting-row">
+<label>Reselect Interval (ms):</label>
+<input type="number" id="scheduled-reselect-interval" value="${CONFIG.scheduledReselectInterval}" min="1000" step="1000">
+</div>
+</div>
+<div class="settings-section">
+<h3>Minute Mark Selection</h3>
+<div class="setting-row">
+<label>Enable Minute Mark Selection:</label>
+<input type="checkbox" id="minute-mark-enabled"${CONFIG.minuteMarkSelectionEnabled ? ' checked' : ''}>
+</div>
+<div class="setting-row">
+<label>Target Post:</label>
+<select id="minute-mark-target-post">
+<option value="ISLAMABAD"${CONFIG.minuteMarkTargetPost === 'ISLAMABAD' ? ' selected' : ''}>Islamabad</option>
+<option value="KARACHI"${CONFIG.minuteMarkTargetPost === 'KARACHI' ? ' selected' : ''}>Karachi</option>
+</select>
+</div>
+<div class="setting-row">
+<label>Trigger Times (mm:ss, comma separated):</label>
+<input type="text" id="minute-mark-times" value="${CONFIG.minuteMarkTimes.join(', ')}" placeholder="29:55, 59:54">
+</div>
+<div class="setting-row">
+<label>⚡ Quick Preset:</label>
+<select id="mm-single-preset" class="preset-inline-select">
+${MINUTE_MARK_PRESETS.map(p => `<option value="${p.value}">${p.label}</option>`).join('')}
+</select>
+</div>
+<div class="setting-row">
+<label>Duration (ms):</label>
+<input type="number" id="minute-mark-duration" value="${CONFIG.minuteMarkDuration}" min="1000" step="1000">
+</div>
+<div class="setting-row">
+<label>Reselect Interval (ms):</label>
+<input type="number" id="minute-mark-reselect-interval" value="${CONFIG.minuteMarkReselectInterval}" min="1000" step="1000">
+</div>
+</div>
+<div class="settings-section" style="border:1px solid #f72585;border-radius:6px;padding:10px;">
+<h3 style="color:#f72585;">⚡ Custom Window (28/29 min burst)</h3>
+<div class="setting-row">
+<label>Enable Custom Windows:</label>
+<input type="checkbox" id="custom-window-enabled"${CONFIG.customWindowEnabled ? ' checked' : ''}>
+</div>
+<div class="setting-row">
+<label>Target Minutes (comma separated):</label>
+<input type="text" id="custom-window-minutes" value="${CONFIG.customWindowMinutes}" placeholder="28, 29">
+</div>
+<div class="setting-row">
+<label>Window 1 — Start second:</label>
+<input type="number" id="custom-w1-start" value="${CONFIG.customWindowW1Start}" min="0" max="59" step="1">
+</div>
+<div class="setting-row">
+<label>Window 1 — End second:</label>
+<input type="number" id="custom-w1-end" value="${CONFIG.customWindowW1End}" min="0" max="59" step="1">
+</div>
+<div class="setting-row">
+<label>Window 2 — Start second:</label>
+<input type="number" id="custom-w2-start" value="${CONFIG.customWindowW2Start}" min="0" max="59" step="1">
+</div>
+<div class="setting-row">
+<label>Window 2 — End second:</label>
+<input type="number" id="custom-w2-end" value="${CONFIG.customWindowW2End}" min="0" max="59" step="1">
+</div>
+<div class="setting-row">
+<label>Window 1 — Interval (seconds):</label>
+<input type="number" id="custom-w1-interval" value="${CONFIG.customWindowW1Interval || 4}" min="1" max="30" step="1">
+</div>
+<div class="setting-row">
+<label>Window 2 — Interval (seconds):</label>
+<input type="number" id="custom-w2-interval" value="${CONFIG.customWindowW2Interval || 3}" min="1" max="30" step="1">
+</div>
+<div class="setting-row" style="font-size:11px;color:#aaa;display:block;">
+⚡ W1 every ${CONFIG.customWindowW1Interval||4}s → :${String(CONFIG.customWindowW1Start).padStart(2,'0')} to :${String(CONFIG.customWindowW1End).padStart(2,'0')} &nbsp;|&nbsp;
+W2 every ${CONFIG.customWindowW2Interval||3}s → :${String(CONFIG.customWindowW2Start).padStart(2,'0')} to :${String(CONFIG.customWindowW2End).padStart(2,'0')}
+</div>
+</div>
+<div class="settings-section">
+<h3>Random Slot Selection (140-second intervals - 2-second windows)</h3>
+<div class="setting-row">
+<label>Enable Random Slot Selection:</label>
+<input type="checkbox" id="random-slot-enabled"${CONFIG.randomSlotSelectionEnabled ? ' checked' : ''}>
+</div>
+<div class="setting-row">
+<label>Target Post:</label>
+<select id="random-target-post">
+<option value="ISLAMABAD"${CONFIG.randomTargetPost === 'ISLAMABAD' ? ' selected' : ''}>Islamabad</option>
+<option value="KARACHI"${CONFIG.randomTargetPost === 'KARACHI' ? ' selected' : ''}>Karachi</option>
+</select>
+</div>
+<div class="setting-row">
+<label>Time Slot Selection:</label>
+<select id="random-slot">
+<option value="manual"${CONFIG.randomSlot === 'manual' ? ' selected' : ''}>Manual Input</option>
+${oddTwoSecondOptions.join('')}
+</select>
+</div>
+<div class="setting-row" id="manual-time-row" style="${CONFIG.randomSlot === 'manual' ? 'display: flex;' : 'display: none;'}">
+<label>Manual Time (0-140, e.g., 138-140):</label>
+<input type="text" id="manual-random-slot" value="${CONFIG.manualRandomSlot}" placeholder="168-170">
+</div>
+</div>
+<div class="settings-buttons">
+<button id="save-settings">Save Settings</button>
+<button id="reset-settings">Reset Defaults</button>
+<button id="close-settings">Close</button>
+</div>
+`;
+return form;
+};
+
+const showSettings = () => {
+state.showSettings = true;
+saveState();
+updateUI();
+
+const settingsForm = createSettingsForm();
+const container = document.getElementById('settings-container');
+container.innerHTML = '';
+container.appendChild(settingsForm);
+
+document.getElementById('random-slot').addEventListener('change', function() {
+const manualRow = document.getElementById('manual-time-row');
+manualRow.style.display = this.value === 'manual' ? 'flex' : 'none';
+});
+
+document.getElementById('sched-single-preset').addEventListener('change', function() {
+if (!this.value) return;
+document.getElementById('scheduled-minutes').value = this.value.split(',').map(s => s.trim()).join(', ');
+showFeedback('Scheduled preset applied ✓');
+});
+
+document.getElementById('mm-single-preset').addEventListener('change', function() {
+if (!this.value) return;
+document.getElementById('minute-mark-times').value = this.value.split(',').map(s => s.trim()).join(', ');
+showFeedback('Minute Mark preset applied ✓');
+});
+
+document.getElementById('save-settings').addEventListener('click', () => {
+CONFIG.manualTargetPost = document.getElementById('manual-target-post').value;
+CONFIG.manualCheckInterval = parseInt(document.getElementById('manual-interval').value) || DEFAULT_CONFIG.manualCheckInterval;
+CONFIG.manualCooldownDuration = parseInt(document.getElementById('manual-cooldown').value) || DEFAULT_CONFIG.manualCooldownDuration;
+CONFIG.globalCooldownOnDates = document.getElementById('global-cooldown-toggle').checked;
+CONFIG.globalCooldownDuration = parseInt(document.getElementById('global-cooldown-duration').value) || DEFAULT_CONFIG.globalCooldownDuration;
+CONFIG.scheduledSelectionEnabled = document.getElementById('scheduled-enabled').checked;
+CONFIG.scheduledTargetPost = document.getElementById('scheduled-target-post').value;
+CONFIG.scheduledHours = document.getElementById('scheduled-hours').value
+.split(',').map(t => parseInt(t.trim())).filter(t => !isNaN(t) && t >= 0 && t <= 23);
+CONFIG.scheduledMinutes = document.getElementById('scheduled-minutes').value
+.split(',').map(t => {
+const parts = t.trim().split(':');
+const minutes = parseInt(parts[0]);
+const seconds = parts[1] ? parseInt(parts[1]) : 0;
+return `${minutes}:${seconds}`;
+}).filter(t => {
+const [minutes, seconds] = t.split(':').map(Number);
+return !isNaN(minutes) && minutes >= 0 && minutes <= 59 && !isNaN(seconds) && seconds >= 0 && seconds <= 59;
+});
+CONFIG.scheduledDuration = parseInt(document.getElementById('scheduled-duration').value) || DEFAULT_CONFIG.scheduledDuration;
+CONFIG.scheduledReselectInterval = parseInt(document.getElementById('scheduled-reselect-interval').value) || DEFAULT_CONFIG.scheduledReselectInterval;
+CONFIG.minuteMarkSelectionEnabled = document.getElementById('minute-mark-enabled').checked;
+CONFIG.minuteMarkTargetPost = document.getElementById('minute-mark-target-post').value;
+CONFIG.minuteMarkTimes = document.getElementById('minute-mark-times').value
+.split(',').map(t => {
+const parts = t.trim().split(':');
+const minutes = parseInt(parts[0]);
+const seconds = parts[1] ? parseInt(parts[1]) : 0;
+return `${minutes}:${seconds}`;
+}).filter(t => {
+const [minutes, seconds] = t.split(':').map(Number);
+return !isNaN(minutes) && minutes >= 0 && minutes <= 59 && !isNaN(seconds) && seconds >= 0 && seconds <= 59;
+});
+CONFIG.minuteMarkDuration = parseInt(document.getElementById('minute-mark-duration').value) || DEFAULT_CONFIG.minuteMarkDuration;
+CONFIG.minuteMarkReselectInterval = parseInt(document.getElementById('minute-mark-reselect-interval').value) || DEFAULT_CONFIG.minuteMarkReselectInterval;
+CONFIG.customWindowEnabled = document.getElementById('custom-window-enabled').checked;
+CONFIG.customWindowMinutes = document.getElementById('custom-window-minutes').value.trim();
+CONFIG.customWindowW1Start = parseInt(document.getElementById('custom-w1-start').value) || 0;
+CONFIG.customWindowW1End = parseInt(document.getElementById('custom-w1-end').value) || 20;
+CONFIG.customWindowW1Interval = parseInt(document.getElementById('custom-w1-interval').value) || 4;
+CONFIG.customWindowW2Start = parseInt(document.getElementById('custom-w2-start').value) || 30;
+CONFIG.customWindowW2End = parseInt(document.getElementById('custom-w2-end').value) || 40;
+CONFIG.customWindowW2Interval = parseInt(document.getElementById('custom-w2-interval').value) || 3;
+CONFIG.randomSlotSelectionEnabled = document.getElementById('random-slot-enabled').checked;
+CONFIG.randomTargetPost = document.getElementById('random-target-post').value;
+CONFIG.randomSlot = document.getElementById('random-slot').value;
+CONFIG.manualRandomSlot = document.getElementById('manual-random-slot').value.trim();
+
+if (CONFIG.dayNightMode === "day") {
+CONFIG.storedDaySettings = {
+minuteMarkTimes: [...CONFIG.minuteMarkTimes],
+minuteMarkDuration: CONFIG.minuteMarkDuration
+};
+}
+
+if (CONFIG.randomSlot === "manual") {
+const [startStr, endStr] = CONFIG.manualRandomSlot.split('-');
+const start = parseInt(startStr);
+const end = parseInt(endStr);
+if (isNaN(start) || isNaN(end) || start < 0 || end > RANDOM_INTERVAL || start >= end) {
+showFeedback('Invalid manual time slot. Using default 138-140');
+CONFIG.manualRandomSlot = "138-140";
+}
+}
+
+saveConfig();
+updateIntervals();
+calculateNextScheduledRun();
+applyPanelTheme();
+showFeedback('Settings saved!');
+hideSettings();
+});
+
+document.getElementById('reset-settings').addEventListener('click', () => {
+Object.assign(CONFIG, DEFAULT_CONFIG);
+saveConfig();
+updateIntervals();
+calculateNextScheduledRun();
+applyPanelTheme();
+showFeedback('Defaults restored!');
+hideSettings();
+});
+
+document.getElementById('close-settings').addEventListener('click', hideSettings);
+};
+
+const hideSettings = () => {
+state.showSettings = false;
+saveState();
+updateUI();
+document.getElementById('settings-container').innerHTML = '';
+};
+
+// CSS
+GM_addStyle(`
+#visa-enhanced-panel {
+position: fixed;
+bottom: 20px;
+right: 20px;
+background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+color: #e6e6e6;
+border-radius: 16px;
+padding: 12px;
+box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 1px 3px rgba(255,255,255,0.1) inset;
+z-index: 99999;
+width: 240px;
+font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+font-size: 14px;
+border: 1px solid rgba(255,255,255,0.1);
+backdrop-filter: blur(10px);
+opacity: 0.98;
+transition: all 0.3s ease;
+}
+#visa-enhanced-panel:hover {
+box-shadow: 0 15px 40px rgba(0,0,0,0.6), 0 1px 3px rgba(255,255,255,0.1) inset;
+transform: translateY(-2px);
+}
+.panel-header {
+display: flex;
+justify-content: space-between;
+align-items: center;
+font-weight: 700;
+margin-bottom: 8px;
+color: #4cc9f0;
+font-size: 14px;
+letter-spacing: 0.5px;
+border-bottom: 1px solid rgba(255,255,255,0.1);
+padding-bottom: 6px;
+text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+}
+.control-section {
+margin-bottom: 8px;
+padding: 8px;
+background: rgba(255,255,255,0.05);
+border-radius: 8px;
+border: 1px solid rgba(255,255,255,0.08);
+}
+#manual-toggle, #reset-cooldown, #restart-script {
+background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%);
+color: white;
+border: none;
+padding: 6px 12px;
+border-radius: 8px;
+cursor: pointer;
+font-weight: 600;
+margin-right: 8px;
+transition: all 0.2s ease;
+box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+#manual-toggle:hover, #reset-cooldown:hover, #restart-script:hover {
+transform: translateY(-2px);
+box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+}
+#reset-cooldown {
+background: linear-gradient(135deg, #f9c74f 0%, #f9844a 100%);
+}
+#restart-script {
+background: linear-gradient(135deg, #4cc9f0 0%, #4895ef 100%);
+}
+#islamabad-btn, #karachi-btn, #day-mode-btn, #night-mode-btn {
+background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%);
+color: white;
+border: none;
+padding: 6px 12px;
+border-radius: 8px;
+cursor: pointer;
+font-weight: 600;
+margin-right: 8px;
+margin-bottom: 4px;
+transition: all 0.2s ease;
+box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+font-size: 12px;
+}
+#islamabad-btn:hover, #karachi-btn:hover, #day-mode-btn:hover, #night-mode-btn:hover {
+transform: translateY(-2px);
+box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+}
+#islamabad-btn.active, #karachi-btn.active {
+background: linear-gradient(135deg, #4cc9f0 0%, #4895ef 100%);
+}
+#day-mode-btn.active {
+background: linear-gradient(135deg, #FFD700 0%, #FFA500 100%);
+}
+#night-mode-btn.active {
+background: linear-gradient(135deg, #4B0082 0%, #2E0854 100%);
+}
+#visa-status {
+margin-top: 8px;
+font-size: 12px;
+color: #c0c0e0;
+line-height: 1.5;
+padding: 8px;
+background: rgba(0,0,0,0.2);
+border-radius: 8px;
+border-left: 3px solid #4361ee;
+}
+#feedback-message {
+height: 20px;
+margin-top: 8px;
+font-size: 12px;
+text-align: center;
+font-weight: 600;
+opacity: 0;
+transition: opacity 0.3s;
+color: #4cc9f0;
+text-shadow: 0 0 8px rgba(76, 201, 240, 0.3);
+}
+#settings-button {
+background: transparent;
+border: none;
+color: #a0a0c0;
+cursor: pointer;
+font-size: 14px;
+padding: 4px;
+border-radius: 6px;
+transition: all 0.2s ease;
+}
+#settings-button:hover {
+color: #4cc9f0;
+background: rgba(76, 201, 240, 0.1);
+transform: rotate(90deg);
+}
+#settings-container {
+position: fixed;
+bottom: 80px;
+right: 20px;
+background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+color: #e6e6e6;
+border-radius: 16px;
+padding: 20px;
+box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+z-index: 100000;
+width: 380px;
+font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+font-size: 14px;
+border: 1px solid rgba(255,255,255,0.1);
+backdrop-filter: blur(10px);
+opacity: 0.98;
+display: none;
+max-height: 70vh;
+overflow-y: auto;
+scrollbar-width: thin;
+scrollbar-color: #4361ee rgba(0,0,0,0.2);
+}
+#settings-container::-webkit-scrollbar { width: 6px; }
+#settings-container::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); border-radius: 3px; }
+#settings-container::-webkit-scrollbar-thumb { background: #4361ee; border-radius: 3px; }
+.settings-section {
+margin-bottom: 20px;
+padding: 12px;
+background: rgba(255,255,255,0.05);
+border-radius: 12px;
+border: 1px solid rgba(255,255,255,0.08);
+}
+.settings-section h3 {
+margin: 0 0 12px 0;
+font-size: 14px;
+color: #4cc9f0;
+border-bottom: 1px solid rgba(255,255,255,0.1);
+padding-bottom: 6px;
+text-transform: uppercase;
+letter-spacing: 0.5px;
+}
+.setting-row {
+display: flex;
+justify-content: space-between;
+margin: 10px 0;
+align-items: center;
+}
+.setting-row label { color: #c0c0e0; font-size: 13px; flex: 1; margin-right: 12px; }
+.setting-row input, .setting-row select {
+width: 100px;
+background: rgba(0,0,0,0.3);
+border: 1px solid rgba(255,255,255,0.1);
+color: #e6e6e6;
+padding: 6px 8px;
+border-radius: 6px;
+font-size: 13px;
+}
+.setting-row input:focus, .setting-row select:focus {
+outline: none;
+border-color: #4361ee;
+box-shadow: 0 0 0 2px rgba(67, 97, 238, 0.3);
+}
+.preset-inline-select {
+width: 100px;
+background: rgba(0,0,0,0.35);
+border: 1px solid rgba(67,97,238,0.5);
+color: #e6e6e6;
+padding: 6px 8px;
+border-radius: 6px;
+font-size: 12px;
+cursor: pointer;
+}
+.preset-inline-select:focus {
+outline: none;
+border-color: #4cc9f0;
+box-shadow: 0 0 0 2px rgba(76,201,240,0.25);
+}
+.settings-buttons { display: flex; justify-content: space-between; margin-top: 20px; gap: 8px; }
+.settings-buttons button {
+background: linear-gradient(135deg, #4361ee 0%, #3a0ca3 100%);
+color: #e6e6e6;
+border: none;
+padding: 8px 12px;
+border-radius: 8px;
+cursor: pointer;
+font-size: 13px;
+font-weight: 600;
+flex: 1;
+transition: all 0.2s ease;
+}
+.settings-buttons button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+#save-settings { background: linear-gradient(135deg, #4cc9f0 0%, #4895ef 100%) !important; }
+#reset-settings { background: linear-gradient(135deg, #f9c74f 0%, #f9844a 100%) !important; }
+#close-settings { background: linear-gradient(135deg, #f72585 0%, #b5179e 100%) !important; }
+.cooldown-active { color: #f9c74f !important; font-weight: bold !important; animation: pulse 2s infinite; }
+.global-cooldown-active { color: #f72585 !important; animation: pulse 1s infinite; }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+
+/* === REMOTE SIGNAL NOTIFICATION === */
+#remote-signal-toast {
+position: fixed;
+top: 30px;
+left: 50%;
+transform: translateX(-50%) translateY(-80px);
+background: linear-gradient(135deg, #0d47a1 0%, #1565c0 100%);
+color: #fff;
+font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+font-size: 16px;
+font-weight: 700;
+padding: 14px 32px;
+border-radius: 12px;
+box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+z-index: 9999999;
+pointer-events: none;
+transition: transform 0.35s cubic-bezier(0.34,1.56,0.64,1), opacity 0.35s ease;
+opacity: 0;
+letter-spacing: 0.5px;
+border: 2px solid rgba(255,255,255,0.2);
+}
+#remote-signal-toast.show {
+transform: translateX(-50%) translateY(0);
+opacity: 1;
+}
+`);
+
+// === REMOTE SIGNAL TOAST ===
+const showRemoteToast = (msg, color) => {
+let toast = document.getElementById('remote-signal-toast');
+if (!toast) {
+toast = document.createElement('div');
+toast.id = 'remote-signal-toast';
+document.body.appendChild(toast);
+}
+toast.textContent = msg;
+toast.style.background = color || 'linear-gradient(135deg, #0d47a1 0%, #1565c0 100%)';
+toast.classList.add('show');
+clearTimeout(toast._hideTimer);
+toast._hideTimer = setTimeout(() => {
+toast.classList.remove('show');
+}, 2500);
+};
+
+// =============================================
+// PANEL COLOR THEMING
+// =============================================
+const PANEL_COLORS = {
+// GREEN (0 / 30)
+0:  { bg: 'linear-gradient(135deg,#003300 0%,#004d00 100%)', border: '#00e676', header: '#00e676', glow: 'rgba(0,230,118,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#00695c,#004d40)', btnSecondary: 'linear-gradient(135deg,#2e7d32,#1b5e20)', btnTertiary: 'linear-gradient(135deg,#00acc1,#00838f)', name: 'GREEN'  },
+// RED (1 / 31)
+1:  { bg: 'linear-gradient(135deg,#3b0000 0%,#5c0000 100%)', border: '#f44336', header: '#ff8a80', glow: 'rgba(244,67,54,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#c62828,#b71c1c)', btnSecondary: 'linear-gradient(135deg,#e65100,#bf360c)', btnTertiary: 'linear-gradient(135deg,#ad1457,#880e4f)', name: 'RED'    },
+// PURPLE (2 / 32)
+2:  { bg: 'linear-gradient(135deg,#1a0033 0%,#2d004d 100%)', border: '#ce93d8', header: '#e040fb', glow: 'rgba(206,147,216,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#6a1b9a,#4a148c)', btnSecondary: 'linear-gradient(135deg,#7b1fa2,#6a1b9a)', btnTertiary: 'linear-gradient(135deg,#4527a0,#311b92)', name: 'PURPLE' },
+// YELLOW (3 / 33)
+3:  { bg: 'linear-gradient(135deg,#332600 0%,#4d3900 100%)', border: '#ffd600', header: '#ffd600', glow: 'rgba(255,214,0,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#f9a825,#f57f17)', btnSecondary: 'linear-gradient(135deg,#ff8f00,#e65100)', btnTertiary: 'linear-gradient(135deg,#6d4c41,#4e342e)', name: 'YELLOW' },
+30: { bg: 'linear-gradient(135deg,#003300 0%,#004d00 100%)', border: '#00e676', header: '#00e676', glow: 'rgba(0,230,118,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#00695c,#004d40)', btnSecondary: 'linear-gradient(135deg,#2e7d32,#1b5e20)', btnTertiary: 'linear-gradient(135deg,#00acc1,#00838f)', name: 'GREEN'  },
+31: { bg: 'linear-gradient(135deg,#3b0000 0%,#5c0000 100%)', border: '#f44336', header: '#ff8a80', glow: 'rgba(244,67,54,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#c62828,#b71c1c)', btnSecondary: 'linear-gradient(135deg,#e65100,#bf360c)', btnTertiary: 'linear-gradient(135deg,#ad1457,#880e4f)', name: 'RED'    },
+32: { bg: 'linear-gradient(135deg,#1a0033 0%,#2d004d 100%)', border: '#ce93d8', header: '#e040fb', glow: 'rgba(206,147,216,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#6a1b9a,#4a148c)', btnSecondary: 'linear-gradient(135deg,#7b1fa2,#6a1b9a)', btnTertiary: 'linear-gradient(135deg,#4527a0,#311b92)', name: 'PURPLE' },
+33: { bg: 'linear-gradient(135deg,#332600 0%,#4d3900 100%)', border: '#ffd600', header: '#ffd600', glow: 'rgba(255,214,0,0.5)',
+      btnPrimary: 'linear-gradient(135deg,#f9a825,#f57f17)', btnSecondary: 'linear-gradient(135deg,#ff8f00,#e65100)', btnTertiary: 'linear-gradient(135deg,#6d4c41,#4e342e)', name: 'YELLOW' },
+};
+
+const applyPanelTheme = () => {
+const w1 = parseInt(CONFIG.customWindowW1Start);
+const w2 = parseInt(CONFIG.customWindowW2Start);
+const theme = PANEL_COLORS[w1] !== undefined ? PANEL_COLORS[w1]
+            : PANEL_COLORS[w2] !== undefined ? PANEL_COLORS[w2]
+            : { bg: 'linear-gradient(135deg,#1a1a2e 0%,#16213e 100%)', border: 'rgba(255,255,255,0.1)', header: '#4cc9f0', glow: 'rgba(0,0,0,0.5)', name: '' };
+
+// ── Main panel ──
+const panel = document.getElementById('visa-enhanced-panel');
+if (panel) {
+panel.style.setProperty('background', theme.bg, 'important');
+panel.style.setProperty('border', `2px solid ${theme.border}`, 'important');
+panel.style.setProperty('box-shadow', `0 10px 30px ${theme.glow}, 0 1px 3px rgba(255,255,255,0.15) inset`, 'important');
+}
+
+// ── Header ──
+const hdr = document.querySelector('#visa-enhanced-panel .panel-header');
+if (hdr) {
+hdr.style.setProperty('color', theme.header, 'important');
+hdr.style.setProperty('-webkit-text-fill-color', theme.header, 'important');
+hdr.style.setProperty('border-bottom-color', theme.border, 'important');
+hdr.style.setProperty('text-shadow', `0 0 10px ${theme.glow}`, 'important');
+}
+
+// ── Control sections — white overlay blends with theme bg ──
+document.querySelectorAll('#visa-enhanced-panel .control-section').forEach(el => {
+el.style.setProperty('background', 'rgba(255,255,255,0.08)', 'important');
+el.style.setProperty('border-color', 'rgba(255,255,255,0.15)', 'important');
+});
+
+// ── Status bar ──
+const statusEl = document.getElementById('visa-status');
+if (statusEl) {
+statusEl.style.setProperty('background', 'rgba(255,255,255,0.07)', 'important');
+statusEl.style.setProperty('border-left-color', theme.border, 'important');
+statusEl.style.setProperty('color', '#e0e0e0', 'important');
+statusEl.style.setProperty('-webkit-text-fill-color', '#e0e0e0', 'important');
+}
+
+// ── Buttons — only theme-colour when theme is set, else leave default ──
+if (theme.btnPrimary) {
+// OFF/ON toggle
+const tog = document.getElementById('manual-toggle');
+if (tog) tog.style.setProperty('background', theme.btnPrimary, 'important');
+
+// Reset Cooldown
+const rc = document.getElementById('reset-cooldown');
+if (rc) rc.style.setProperty('background', theme.btnSecondary, 'important');
+
+// Restart
+const rs = document.getElementById('restart-script');
+if (rs) rs.style.setProperty('background', theme.btnTertiary, 'important');
+
+// Post buttons
+['islamabad-btn','karachi-btn'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.style.setProperty('background', theme.btnPrimary, 'important');
+});
+
+// Day / Night buttons
+const dayBtn   = document.getElementById('day-mode-btn');
+const nightBtn = document.getElementById('night-mode-btn');
+if (dayBtn)   dayBtn.style.setProperty('background',   CONFIG.dayNightMode === 'day'   ? theme.btnSecondary : theme.btnPrimary, 'important');
+if (nightBtn) nightBtn.style.setProperty('background', CONFIG.dayNightMode === 'night' ? theme.btnTertiary  : theme.btnPrimary, 'important');
+}
+};
+
+const createControlPanel = () => {
+const panel = document.createElement('div');
+panel.id = 'visa-enhanced-panel';
+panel.innerHTML = `
+<div class="panel-header">
+<span>USA APPOINTMENT HELPER</span>
+<button id="settings-button">⚙️</button>
+</div>
+<div class="control-section">
+<button id="manual-toggle">${state.manualIsRunning ? 'ON' : 'OFF'}</button>
+<button id="reset-cooldown">Reset Cooldown</button>
+<button id="restart-script">Restart</button>
+</div>
+<div class="control-section">
+<button id="islamabad-btn">Islamabad</button>
+<button id="karachi-btn">Karachi</button>
+</div>
+<div class="control-section">
+<button id="day-mode-btn" class="${CONFIG.dayNightMode === 'day' ? 'active' : ''}">☀️ Day</button>
+<button id="night-mode-btn" class="${CONFIG.dayNightMode === 'night' ? 'active' : ''}">🌙 Night</button>
+</div>
+<div class="control-section">
+<button id="share-data-btn" style="background:linear-gradient(135deg,#f9a825 0%,#f57f17 100%);width:100%;font-weight:700;letter-spacing:1px;">📡 Share Data</button>
+</div>
+<div id="visa-status">${getStatusText()}</div>
+<div id="feedback-message"></div>
+`;
+document.body.appendChild(panel);
+
+const settingsContainer = document.createElement('div');
+settingsContainer.id = 'settings-container';
+document.body.appendChild(settingsContainer);
+
+document.getElementById('manual-toggle').addEventListener('click', () => {
+state.manualIsRunning = !state.manualIsRunning;
+saveState();
+document.getElementById('manual-toggle').textContent = state.manualIsRunning ? 'ON' : 'OFF';
+document.getElementById('manual-toggle').style.background = state.manualIsRunning ?
+'linear-gradient(135deg, #4cc9f0 0%, #4895ef 100%)' :
+'linear-gradient(135deg, #f72585 0%, #b5179e 100%)';
+if (state.manualIsRunning) {
+manualRunCheck();
+manualIntervalId = setInterval(manualRunCheck, CONFIG.manualCheckInterval);
+} else {
+clearInterval(manualIntervalId);
+}
+updateUI();
+});
+
+document.getElementById('reset-cooldown').addEventListener('click', resetAllCooldowns);
+document.getElementById('restart-script').addEventListener('click', restartScript);
+document.getElementById('settings-button').addEventListener('click', () => {
+if (state.showSettings) hideSettings(); else showSettings();
+});
+document.getElementById('islamabad-btn').addEventListener('click', switchToIslamabad);
+document.getElementById('karachi-btn').addEventListener('click', switchToKarachi);
+document.getElementById('day-mode-btn').addEventListener('click', enableDayMode);
+document.getElementById('night-mode-btn').addEventListener('click', enableNightMode);
+document.getElementById('share-data-btn').addEventListener('click', shareSettingsViaAbly);
+applyPanelTheme();
+};
+
+const updateUI = () => {
+const statusEl = document.getElementById('visa-status');
+if (statusEl) {
+statusEl.textContent = getStatusText();
+statusEl.classList.toggle('cooldown-active', isInCooldown());
+statusEl.classList.toggle('global-cooldown-active', state.globalCooldownActive);
+}
+const settingsContainer = document.getElementById('settings-container');
+if (settingsContainer) {
+settingsContainer.style.display = state.showSettings ? 'block' : 'none';
+}
+const manualToggle = document.getElementById('manual-toggle');
+if (manualToggle) {
+manualToggle.style.background = state.manualIsRunning ?
+'linear-gradient(135deg, #4cc9f0 0%, #4895ef 100%)' :
+'linear-gradient(135deg, #f72585 0%, #b5179e 100%)';
+}
+const islamabadBtn = document.getElementById('islamabad-btn');
+const karachiBtn = document.getElementById('karachi-btn');
+if (islamabadBtn && karachiBtn) {
+islamabadBtn.classList.toggle('active', CONFIG.manualTargetPost === 'ISLAMABAD');
+karachiBtn.classList.toggle('active', CONFIG.manualTargetPost === 'KARACHI');
+}
+const dayBtn = document.getElementById('day-mode-btn');
+const nightBtn = document.getElementById('night-mode-btn');
+if (dayBtn && nightBtn) {
+dayBtn.classList.toggle('active', CONFIG.dayNightMode === 'day');
+nightBtn.classList.toggle('active', CONFIG.dayNightMode === 'night');
+}
+applyPanelTheme();
+};
+
+// =============================================
+// ABLY REMOTE CONTROL — CONSTANTS + SHARING
+// =============================================
+const ABLY_KEY     = '6RlOZA.yeTjlw:OuDmyTsbHPJFIgEgLheQFF4Xkkt0-S9Yc_Ce6nWPlLg';
+const ABLY_CHANNEL = 'visa-notifier';
+let _deviceId = GM_getValue('usvisaDeviceId');
+if (!_deviceId) {
+  _deviceId = 'DEV-' + Math.random().toString(36).slice(2,7).toUpperCase();
+  GM_setValue('usvisaDeviceId', _deviceId);
+}
+
+const shareSettingsViaAbly = () => {
+try {
+  const ablyPub = new Ably.Realtime(ABLY_KEY);
+  ablyPub.connection.once('connected', () => {
+    const ch = ablyPub.channels.get(ABLY_CHANNEL);
+    const payload = {
+      type:      'DEVICE_SETTINGS',
+      deviceId:  _deviceId,
+      timestamp: Date.now(),
+      config:    JSON.parse(JSON.stringify(CONFIG))
+    };
+    ch.publish('device_settings', payload, (err) => {
+      if (err) {
+        showFeedback('❌ Share failed: ' + err.message);
+        console.error('[SHARE] publish error', err);
+      } else {
+        showFeedback('📡 Settings shared! (' + _deviceId + ')');
+        flashScreen('#f9a825', 600);
+      }
+      ablyPub.close();
+    });
+  });
+  ablyPub.connection.once('failed', () => {
+    showFeedback('❌ Ably connect failed');
+  });
+} catch(e) {
+  showFeedback('❌ Share error: ' + e.message);
+  console.error('[SHARE]', e);
+}
+};
+
+// =============================================
+// ABLY REMOTE CONTROL — SIGNAL RECEIVER
+// =============================================
+const setupAblyReceiver = () => {
+try {
+const ably = new Ably.Realtime(ABLY_KEY);
+const channel = ably.channels.get(ABLY_CHANNEL);
+
+// Listen for push-config from control panel
+channel.subscribe('push_config', (message) => {
+  const data = message.data;
+  if (data.target !== 'ALL' && data.target !== _deviceId) return;
+  console.log('[RECEIVER] push_config received for', data.target);
+  CONFIG = {...DEFAULT_CONFIG, ...CONFIG, ...data.config};
+  saveConfig();
+  applyPanelTheme();
+  restartScript();
+  showFeedback('🔄 Config synced from control panel!');
+  showRemoteToast('🔄 Config synced!', 'linear-gradient(135deg,#00897b 0%,#004d40 100%)');
+  flashScreen('#00897b', 800);
+});
+
+channel.subscribe('msg', (message) => {
+const signal = message.data;
+console.log('[RECEIVER] Got signal:', signal);
+
+if (signal === 'RESELECT_500') {
+CONFIG.minuteMarkReselectInterval = 500;
+saveConfig();
+updateIntervals();
+showFeedback('⚡ Remote: 500ms interval applied!');
+showRemoteToast('⚡ 500ms Interval Applied!', 'linear-gradient(135deg, #1565c0 0%, #0d47a1 100%)');
+flashScreen('#1565c0', 800);
+updateUI();
+console.log('[RECEIVER] minuteMarkReselectInterval → 500ms');
+
+} else if (signal === 'RESELECT_2000') {
+CONFIG.minuteMarkReselectInterval = 2000;
+saveConfig();
+updateIntervals();
+showFeedback('🔵 Remote: 2000ms interval applied!');
+showRemoteToast('🔵 2000ms Interval Applied!', 'linear-gradient(135deg, #2e7d32 0%, #1b5e20 100%)');
+flashScreen('#2e7d32', 800);
+updateUI();
+console.log('[RECEIVER] minuteMarkReselectInterval → 2000ms');
+
+} else if (signal === 'RESELECT_3000') {
+CONFIG.minuteMarkReselectInterval = 3000;
+saveConfig();
+updateIntervals();
+showFeedback('🟡 Remote: 3000ms interval applied!');
+showRemoteToast('🟡 3000ms Interval Applied!', 'linear-gradient(135deg, #e65100 0%, #bf360c 100%)');
+flashScreen('#e65100', 800);
+updateUI();
+console.log('[RECEIVER] minuteMarkReselectInterval → 3000ms');
+
+} else if (signal === 'KARACHI_ON') {
+switchToKarachi();
+showRemoteToast('📍 Karachi Post ON', 'linear-gradient(135deg, #880e4f 0%, #ad1457 100%)');
+
+} else if (signal === 'KARACHI_OFF') {
+switchToIslamabad();
+showRemoteToast('📍 Karachi Post OFF', '#555');
+
+} else if (signal === 'ISLAMABAD_ON') {
+switchToIslamabad();
+showRemoteToast('📍 Islamabad Post ON', 'linear-gradient(135deg, #4a148c 0%, #6a1b9a 100%)');
+
+} else if (signal === 'ISLAMABAD_OFF') {
+showRemoteToast('📍 Islamabad Post OFF', '#555');
+}
+});
+
+ably.connection.on('connected', () => {
+console.log('[RECEIVER] Ably connected — listening for signals');
+});
+
+ably.connection.on('failed', () => {
+console.warn('[RECEIVER] Ably connection failed');
+});
+
+} catch (e) {
+console.error('[RECEIVER] Ably setup error:', e);
+}
+};
+
+const initialize = () => {
+loadState();
+createControlPanel();
+setupDateObserver();
+setupAblyReceiver(); // ← NEW: start listening for remote signals
+
+if (state.manualIsRunning) {
+manualIntervalId = setInterval(manualRunCheck, CONFIG.manualCheckInterval);
+}
+timeCheckIntervalId = setInterval(checkScheduledTimes, 1000);
+minuteMarkCheckIntervalId = setInterval(checkMinuteMarks, 1000);
+randomCheckIntervalId = setInterval(checkRandomSlots, 200);
+loadingCheckIntervalId = setInterval(() => {
+if (state.isCurrentlySelecting && !isLoadingVisible()) {
+state.isCurrentlySelecting = false;
+}
+}, 500);
+
+watchdogIntervalId = setInterval(runWatchdog, 5000);
+setInterval(updateUI, 1000);
+startCustomWindowLoop();
+calculateNextScheduledRun();
+
+const now = Date.now();
+if (state.globalCooldownEnd > now) {
+state.globalCooldownActive = true;
+setTimeout(() => {
+state.globalCooldownActive = false;
+state.globalCooldownEnd = 0;
+saveState();
+updateUI();
+if (!isInCooldown()) resetPostSelection();
+}, state.globalCooldownEnd - now);
+}
+
+if (state.manualCooldownEnd > now) {
+state.manualIsCooldown = true;
+setTimeout(() => {
+state.manualIsCooldown = false;
+state.manualCooldownEnd = 0;
+saveState();
+updateUI();
+if (!isInCooldown()) resetPostSelection();
+}, state.manualCooldownEnd - now);
+}
+
+if (state.scheduledEndTime > now) {
+state.scheduledIsActive = true;
+const remaining = state.scheduledEndTime - now;
+scheduledSelectPost();
+state.scheduledIntervalId = setInterval(() => {
+if (!state.scheduledIsActive) return;
+if (isInCooldown()) { stopScheduledSelection(); return; }
+if (Date.now() - state.lastScheduledSelection >= CONFIG.scheduledReselectInterval) {
+if (checkForAvailableDates()) { stopScheduledSelection(); return; }
+scheduledSelectPost();
+}
+}, 1000);
+setTimeout(() => { stopScheduledSelection(); showFeedback('Scheduled selection period ended'); }, remaining);
+}
+
+if (state.minuteMarkEndTime > now) {
+state.minuteMarkActive = true;
+const remaining = state.minuteMarkEndTime - now;
+minuteMarkSelectPost();
+state.minuteMarkIntervalId = setInterval(() => {
+if (!state.minuteMarkActive) return;
+if (isInCooldown()) { stopMinuteMarkSelection(); return; }
+if (Date.now() - state.lastMinuteMarkSelection >= CONFIG.minuteMarkReselectInterval) {
+if (checkForAvailableDates()) { stopMinuteMarkSelection(); return; }
+minuteMarkSelectPost();
+}
+}, 1000);
+setTimeout(() => { stopMinuteMarkSelection(); showFeedback('Minute mark selection period ended'); }, remaining);
+}
+
+updateUI();
+};
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+initialize();
+} else {
+window.addEventListener('DOMContentLoaded', initialize);
+}
+})();
